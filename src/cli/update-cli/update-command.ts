@@ -125,7 +125,18 @@ export async function updateCommand(inputOpts: UpdateCommandOptions): Promise<vo
           }
           try {
             await recoveryState.windowsTaskAutoStartRecovery?.restore();
-          } catch (error) {
+            await recoveryState.windowsTaskAutoStartRecovery?.complete();
+          } catch (restoreError) {
+            let error = restoreError;
+            try {
+              await recoveryState.windowsTaskAutoStartRecovery?.complete(false);
+            } catch (compensationError) {
+              error = new AggregateError(
+                [error, compensationError],
+                `Windows task autostart recovery failed: ${formatErrorMessage(error)}; ${formatErrorMessage(compensationError)}`,
+                { cause: error },
+              );
+            }
             if (failure?.error instanceof UpdateCommandFailure) {
               // A rejected restore promise can be observed again during unwinding.
               // Keep the reported failure and never turn cleanup into safe-exit 80.
@@ -148,8 +159,6 @@ export async function updateCommand(inputOpts: UpdateCommandOptions): Promise<vo
                   : error,
               };
             }
-          } finally {
-            await recoveryState.windowsTaskAutoStartRecovery?.complete();
           }
           if (failure) {
             if (!recoveryState.ledgerHandoffOwned) {
@@ -670,8 +679,6 @@ async function updateCommandInternal(
   recoveryState.triageTarget.env =
     recoveryEnv ?? ownedManagedUpdateContext?.env ?? recoveryState.triageTarget.env;
   const finalizationConfigSnapshot = ownedManagedUpdateContext?.configSnapshot ?? configSnapshot;
-  const finalizationPluginInstallRecords =
-    ownedManagedUpdateContext?.pluginInstallRecords ?? preUpdatePluginInstallRecords;
   stop();
   const finalization = {
     result,
@@ -689,7 +696,8 @@ async function updateCommandInternal(
     preManagedServiceStop,
     ownedManagedUpdateEnv: ownedManagedUpdateContext?.env,
     controlPlaneUpdateSentinelMeta,
-    preUpdatePluginInstallRecords: finalizationPluginInstallRecords,
+    preUpdatePluginInstallRecords:
+      ownedManagedUpdateContext?.pluginInstallRecords ?? preUpdatePluginInstallRecords,
     startedAt,
     packageUpdateNodeRunner,
     updateStepTimeoutMs,
