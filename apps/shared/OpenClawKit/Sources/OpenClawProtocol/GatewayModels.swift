@@ -7384,6 +7384,76 @@ public struct SessionVisibilitySetResult: Codable, Sendable {
     }
 }
 
+public struct SessionPublicShare: Codable, Sendable {
+    public let id: String
+    public let sessionid: String
+    public let createdat: Int
+
+    public init(
+        id: String,
+        sessionid: String,
+        createdat: Int)
+    {
+        self.id = id
+        self.sessionid = sessionid
+        self.createdat = createdat
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case sessionid = "sessionId"
+        case createdat = "createdAt"
+    }
+}
+
+public struct SessionPublicShareSetParams: Codable, Sendable {
+    public let sessionkey: String
+    public let agentid: String?
+    public let expectedsessionid: String
+    public let enabled: Bool
+
+    public init(
+        sessionkey: String,
+        agentid: String? = nil,
+        expectedsessionid: String,
+        enabled: Bool)
+    {
+        self.sessionkey = sessionkey
+        self.agentid = agentid
+        self.expectedsessionid = expectedsessionid
+        self.enabled = enabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionkey = "sessionKey"
+        case agentid = "agentId"
+        case expectedsessionid = "expectedSessionId"
+        case enabled
+    }
+}
+
+public struct SessionPublicShareSetResult: Codable, Sendable {
+    public let ok: Bool
+    public let sessionkey: String
+    public let publicshare: SessionPublicShare?
+
+    public init(
+        ok: Bool,
+        sessionkey: String,
+        publicshare: SessionPublicShare? = nil)
+    {
+        self.ok = ok
+        self.sessionkey = sessionkey
+        self.publicshare = publicshare
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case ok
+        case sessionkey = "sessionKey"
+        case publicshare = "publicShare"
+    }
+}
+
 public struct SessionMembersListParams: Codable, Sendable {
     public let sessionkey: String
     public let agentid: String?
@@ -7452,6 +7522,7 @@ public struct SessionMemberEvidence: Codable, Sendable {
 
 public struct SessionMembersListResult: Codable, Sendable {
     public let sessionkey: String
+    public let publicshare: SessionPublicShare?
     public let owner: SessionSharingIdentity?
     public let members: [SessionMember]
     public let identities: [SessionSharingIdentity]
@@ -7460,6 +7531,7 @@ public struct SessionMembersListResult: Codable, Sendable {
 
     public init(
         sessionkey: String,
+        publicshare: SessionPublicShare? = nil,
         owner: SessionSharingIdentity? = nil,
         members: [SessionMember],
         identities: [SessionSharingIdentity],
@@ -7467,6 +7539,7 @@ public struct SessionMembersListResult: Codable, Sendable {
         allowedvisibilities: [SessionVisibility])
     {
         self.sessionkey = sessionkey
+        self.publicshare = publicshare
         self.owner = owner
         self.members = members
         self.identities = identities
@@ -7476,6 +7549,7 @@ public struct SessionMembersListResult: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case sessionkey = "sessionKey"
+        case publicshare = "publicShare"
         case owner
         case members
         case identities
@@ -7486,6 +7560,7 @@ public struct SessionMembersListResult: Codable, Sendable {
 
 public struct SessionMembersListEvidenceResult: Codable, Sendable {
     public let sessionkey: String
+    public let publicshare: SessionPublicShare?
     public let owner: SessionSharingIdentity?
     public let members: [SessionMemberEvidence]
     public let identities: [SessionSharingIdentity]
@@ -7494,6 +7569,7 @@ public struct SessionMembersListEvidenceResult: Codable, Sendable {
 
     public init(
         sessionkey: String,
+        publicshare: SessionPublicShare? = nil,
         owner: SessionSharingIdentity? = nil,
         members: [SessionMemberEvidence],
         identities: [SessionSharingIdentity],
@@ -7501,6 +7577,7 @@ public struct SessionMembersListEvidenceResult: Codable, Sendable {
         allowedvisibilities: [SessionVisibility])
     {
         self.sessionkey = sessionkey
+        self.publicshare = publicshare
         self.owner = owner
         self.members = members
         self.identities = identities
@@ -7510,6 +7587,7 @@ public struct SessionMembersListEvidenceResult: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case sessionkey = "sessionKey"
+        case publicshare = "publicShare"
         case owner
         case members
         case identities
