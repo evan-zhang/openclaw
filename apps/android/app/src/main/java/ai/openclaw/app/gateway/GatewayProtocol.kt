@@ -922,6 +922,8 @@ enum class GatewayMethod(
   UpdateRunsList("update.runs.list"),
   GatewaySuspendHandoff("gateway.suspend.handoff"),
   UpdateReport("update.report"),
+  TranscriptsExport("transcripts.export"),
+  TranscriptsStatus("transcripts.status"),
 }
 
 enum class GatewayEvent(
