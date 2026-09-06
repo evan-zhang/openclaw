@@ -496,7 +496,6 @@ const CORE_GATEWAY_METHOD_SPECS = [
   ["sessions.observer.visibility", "session-observer-rpc", "operator.read", "2026.7"],
   // Additive phase-2 collaboration methods append so older advertised indices stay stable.
   ["session.visibility.set", "sessions-sharing", "operator.write", "2026.7"],
-  ["session.publicShare.set", "sessions-sharing", "operator.write", "2026.9"],
   ["session.members.list", "sessions-sharing", "operator.read", "2026.7"],
   ["session.members.add", "sessions-sharing", "operator.write", "2026.7"],
   ["session.members.remove", "sessions-sharing", "operator.write", "2026.7"],
@@ -649,6 +648,8 @@ const CORE_GATEWAY_METHOD_SPECS = [
   ["update.runs.get", "update", "operator.admin", "2026.9"],
   ["update.runs.list", "update", "operator.admin", "2026.9"],
   ["gateway.suspend.handoff", "suspend", "operator.admin", "2026.9", CONTROL_PLANE_WRITE],
+  // Public sharing appends so every previously advertised method index remains stable.
+  ["session.publicShare.set", "sessions-sharing", "operator.write", "2026.9"],
 ] as const satisfies readonly CoreGatewayMethodSpecRow[];
 
 export type CoreGatewayHandlerFamily = Exclude<(typeof CORE_GATEWAY_METHOD_SPECS)[number][1], null>;
