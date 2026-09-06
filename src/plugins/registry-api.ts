@@ -5,6 +5,7 @@ import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { resolveUserPath } from "../utils.js";
 import { emitPluginAgentEvent } from "./agent-event-emission.js";
 import { buildPluginApi } from "./api-builder.js";
+import { resolveCapabilityProviderRegistration } from "./capability-catalog.js";
 import {
   clearPluginRunContext,
   getPluginRunContext,
@@ -197,11 +198,27 @@ export function createPluginApiFactory(
                 registerAgentHarness(record, harness, options),
               registerDetachedTaskRuntime: (runtime) =>
                 registerDetachedTaskRuntime(record, runtime),
-              registerSpeechProvider: (provider) => registerSpeechProvider(record, provider),
-              registerRealtimeTranscriptionProvider: (provider) =>
-                registerRealtimeTranscriptionProvider(record, provider),
-              registerRealtimeVoiceProvider: (provider) =>
-                registerRealtimeVoiceProvider(record, provider),
+              registerSpeechProvider: (entry) => {
+                const provider = resolveCapabilityProviderRegistration(
+                  entry,
+                  registryParams.resolveCapabilityCatalogContext,
+                );
+                registerSpeechProvider(record, provider);
+              },
+              registerRealtimeTranscriptionProvider: (entry) => {
+                const provider = resolveCapabilityProviderRegistration(
+                  entry,
+                  registryParams.resolveCapabilityCatalogContext,
+                );
+                registerRealtimeTranscriptionProvider(record, provider);
+              },
+              registerRealtimeVoiceProvider: (entry) => {
+                const provider = resolveCapabilityProviderRegistration(
+                  entry,
+                  registryParams.resolveCapabilityCatalogContext,
+                );
+                registerRealtimeVoiceProvider(record, provider);
+              },
               registerMediaUnderstandingProvider: (provider) =>
                 registerMediaUnderstandingProvider(record, provider),
               registerTranscriptSourceProvider: (provider) =>

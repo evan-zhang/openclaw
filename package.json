@@ -396,7 +396,12 @@
     "!dist/plugin-sdk/blob-runtime.d.ts",
     "!dist/plugin-sdk/realtime-transcription-session.d.ts",
     "!dist/plugin-sdk/speech-provider.d.ts",
-    "!dist/plugin-sdk/realtime-voice-provider.d.ts"
+    "!dist/plugin-sdk/realtime-voice-provider.d.ts",
+    "!dist/plugin-sdk/provider-model-metadata.d.ts",
+    "!dist/plugin-sdk/embedding-provider-adapter.d.ts",
+    "!dist/plugin-sdk/agent-harness-registration.d.ts",
+    "!dist/plugin-sdk/provider-auth-aliases.d.ts",
+    "!dist/plugin-sdk/session-catalog-paging.d.ts"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -716,6 +721,9 @@
     "./plugin-sdk/embedding-providers": {
       "default": "./dist/plugin-sdk/embedding-providers.js"
     },
+    "./plugin-sdk/embedding-provider-adapter": {
+      "default": "./dist/plugin-sdk/embedding-provider-adapter.js"
+    },
     "./plugin-sdk/media-generation-runtime": {
       "default": "./dist/plugin-sdk/media-generation-runtime.js"
     },
@@ -839,6 +847,9 @@
     },
     "./plugin-sdk/agent-harness-exec-review-runtime": {
       "default": "./dist/plugin-sdk/agent-harness-exec-review-runtime.js"
+    },
+    "./plugin-sdk/agent-harness-registration": {
+      "default": "./dist/plugin-sdk/agent-harness-registration.js"
     },
     "./plugin-sdk/agent-harness-runtime": {
       "types": "./dist/plugin-sdk/agent-harness-runtime.d.ts",
@@ -1134,6 +1145,9 @@
       "types": "./dist/plugin-sdk/session-catalog.d.ts",
       "default": "./dist/plugin-sdk/session-catalog.js"
     },
+    "./plugin-sdk/session-catalog-paging": {
+      "default": "./dist/plugin-sdk/session-catalog-paging.js"
+    },
     "./plugin-sdk/session-catalog-runtime": {
       "default": "./dist/plugin-sdk/session-catalog-runtime.js"
     },
@@ -1342,6 +1356,9 @@
       "types": "./dist/plugin-sdk/provider-auth.d.ts",
       "default": "./dist/plugin-sdk/provider-auth.js"
     },
+    "./plugin-sdk/provider-auth-aliases": {
+      "default": "./dist/plugin-sdk/provider-auth-aliases.js"
+    },
     "./plugin-sdk/provider-oauth-runtime": {
       "default": "./dist/plugin-sdk/provider-oauth-runtime.js"
     },
@@ -1389,6 +1406,9 @@
     },
     "./plugin-sdk/provider-model-types": {
       "default": "./dist/plugin-sdk/provider-model-types.js"
+    },
+    "./plugin-sdk/provider-model-metadata": {
+      "default": "./dist/plugin-sdk/provider-model-metadata.js"
     },
     "./plugin-sdk/provider-model-shared": {
       "default": "./dist/plugin-sdk/provider-model-shared.js"
