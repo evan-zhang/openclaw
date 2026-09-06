@@ -58,7 +58,7 @@ export async function startSetupActivationWizard(params: {
             prompter,
             signal,
             isCancelled: () => signal.aborted,
-            beforePersistentEffect: () => runnerSession.lockCancellation(),
+            beforePersistentEffect: () => runnerSession.lockCancellationForPreparation(),
             onCommitStarted: () => runnerSession.lockCancellation(),
           });
           if (!result.ok) {

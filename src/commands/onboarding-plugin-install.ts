@@ -718,6 +718,7 @@ async function runOnboardingPluginInstallWithProgress(params: {
   runtime: RuntimeEnv;
   spec: string;
   onCapabilityConsent: PluginCapabilityConsentHandler;
+  reviewOfficialArtifacts?: boolean;
   beforePersistentEffect?: () => void | Promise<void>;
   install: (
     logger: {
@@ -733,6 +734,7 @@ async function runOnboardingPluginInstallWithProgress(params: {
   const capabilityConsent = await prepareManagedPluginArtifactConsentHandler({
     config: params.cfg,
     source: "npm",
+    reviewOfficialArtifacts: params.reviewOfficialArtifacts,
     spec: params.spec,
     expectedIntegrity: params.entry.install.expectedIntegrity,
     onCapabilityConsent: consent.onCapabilityConsent,
@@ -799,6 +801,7 @@ async function installPluginFromNpmSpecWithProgress(params: {
   prompter: WizardPrompter;
   runtime: RuntimeEnv;
   onCapabilityConsent: PluginCapabilityConsentHandler;
+  reviewOfficialArtifacts?: boolean;
   beforePersistentEffect?: () => void | Promise<void>;
   trustedSourceLinkedOfficialInstall?: boolean;
 }): Promise<InstallOutcome<InstallPluginResult>> {
@@ -832,6 +835,7 @@ async function installPluginFromNpmPackArchiveWithProgress(params: {
   prompter: WizardPrompter;
   runtime: RuntimeEnv;
   onCapabilityConsent: PluginCapabilityConsentHandler;
+  reviewOfficialArtifacts?: boolean;
   beforePersistentEffect?: () => void | Promise<void>;
 }): Promise<InstallOutcome<InstallPluginResult & { npmTarballName?: string }>> {
   return await runOnboardingPluginInstallWithProgress({
@@ -861,6 +865,7 @@ async function installPluginFromOverride(params: {
   prompter: WizardPrompter;
   runtime: RuntimeEnv;
   onCapabilityConsent: PluginCapabilityConsentHandler;
+  reviewOfficialArtifacts?: boolean;
   beforePersistentEffect?: () => void | Promise<void>;
 }): Promise<OnboardingPluginInstallResult> {
   const { entry, prompter, runtime } = params;
@@ -878,6 +883,7 @@ async function installPluginFromOverride(params: {
           prompter,
           runtime,
           onCapabilityConsent: params.onCapabilityConsent,
+          reviewOfficialArtifacts: params.reviewOfficialArtifacts,
           beforePersistentEffect: params.beforePersistentEffect,
           trustedSourceLinkedOfficialInstall: false,
         })
@@ -888,6 +894,7 @@ async function installPluginFromOverride(params: {
           prompter,
           runtime,
           onCapabilityConsent: params.onCapabilityConsent,
+          reviewOfficialArtifacts: params.reviewOfficialArtifacts,
           beforePersistentEffect: params.beforePersistentEffect,
         });
 
@@ -961,12 +968,14 @@ async function installPluginFromClawHubSpecWithProgress(params: {
   prompter: WizardPrompter;
   runtime: RuntimeEnv;
   onCapabilityConsent: PluginCapabilityConsentHandler;
+  reviewOfficialArtifacts?: boolean;
   beforePersistentEffect?: () => void | Promise<void>;
 }): Promise<{ result: InstallPluginFromClawHubResult; capabilityConsent: ArtifactConsent }> {
   const consent = capturePluginCapabilityConsentHandlerErrors(params.onCapabilityConsent);
   const capabilityConsent = await prepareManagedPluginArtifactConsentHandler({
     config: params.cfg,
     source: "clawhub",
+    reviewOfficialArtifacts: params.reviewOfficialArtifacts,
     spec: params.clawhubSpec,
     expectedIntegrity: params.entry.install.expectedIntegrity,
     onCapabilityConsent: consent.onCapabilityConsent,
@@ -1052,6 +1061,7 @@ export async function ensureOnboardingPluginInstalled(params: {
   workspaceDir?: string;
   promptInstall?: boolean;
   autoConfirmSingleSource?: boolean;
+  reviewOfficialArtifacts?: boolean;
   beforePersistentEffect?: () => void | Promise<void>;
   onCapabilityConsent?: PluginCapabilityConsentHandler;
 }): Promise<OnboardingPluginInstallResult> {
@@ -1072,6 +1082,7 @@ export async function ensureOnboardingPluginInstalled(params: {
         prompter,
         runtime,
         onCapabilityConsent,
+        reviewOfficialArtifacts: params.reviewOfficialArtifacts,
         beforePersistentEffect: params.beforePersistentEffect,
       }),
     );
@@ -1204,6 +1215,7 @@ export async function ensureOnboardingPluginInstalled(params: {
                     prompter,
                     runtime,
                     onCapabilityConsent,
+                    reviewOfficialArtifacts: params.reviewOfficialArtifacts,
                     beforePersistentEffect: params.beforePersistentEffect,
                   })),
                 }
@@ -1214,6 +1226,7 @@ export async function ensureOnboardingPluginInstalled(params: {
                   prompter,
                   runtime,
                   onCapabilityConsent,
+                  reviewOfficialArtifacts: params.reviewOfficialArtifacts,
                   beforePersistentEffect: params.beforePersistentEffect,
                 }),
           isRetryable: (attempt) =>

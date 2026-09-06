@@ -264,6 +264,8 @@ export class WizardSession {
   private deliveredProgressStepIds = new Set<string>();
   private stepDeferred: Deferred<WizardStep | null> | null = null;
   private cancellationLocked = false;
+  private preparationCancellationLocked = false;
+  private expiryPending = false;
   private settled = false;
   private pendingExternalUrl: string | undefined;
   private answerDeferred = new Map<
@@ -291,7 +293,10 @@ export class WizardSession {
   ) {
     const prompter = createWizardSessionPrompter(this);
     if (options?.timeoutMs !== undefined) {
-      this.expiryTimer = setTimeout(() => this.cancel(), options.timeoutMs);
+      this.expiryTimer = setTimeout(() => {
+        this.expiryPending = true;
+        this.cancel();
+      }, options.timeoutMs);
       this.expiryTimer.unref?.();
     }
     this.runnerPromise = this.run(prompter);
@@ -395,7 +400,11 @@ export class WizardSession {
   }
 
   cancel(): boolean {
-    if (this.status !== "running" || this.cancellationLocked) {
+    if (
+      this.status !== "running" ||
+      this.cancellationLocked ||
+      this.preparationCancellationLocked
+    ) {
       return false;
     }
     this.status = "cancelled";
@@ -411,7 +420,25 @@ export class WizardSession {
   /** The underlying mutation crossed its durable commit point and must finish. */
   lockCancellation() {
     this.signal.throwIfAborted();
+    if (!this.cancellationLocked) {
+      this.finishPreparationEffect();
+    }
     this.cancellationLocked = true;
+  }
+
+  /** Protect preparation until the next client checkpoint or final commit. */
+  lockCancellationForPreparation() {
+    this.signal.throwIfAborted();
+    this.preparationCancellationLocked = true;
+  }
+
+  private finishPreparationEffect() {
+    this.preparationCancellationLocked = false;
+    // Expiry during an artifact commit remains due at the next safe checkpoint.
+    if (this.expiryPending) {
+      this.cancel();
+      this.signal.throwIfAborted();
+    }
   }
 
   get signal(): AbortSignal {
@@ -514,6 +541,9 @@ export class WizardSession {
       throw new Error("wizard: session not running");
     }
     signal?.throwIfAborted();
+    if (wizardStepAwaitsInput(step) || (step.type === "note" && step.executor === "client")) {
+      this.finishPreparationEffect();
+    }
     const deferred = createDeferredCore<unknown>();
     this.answerDeferred.set(step.id, { deferred, text: step.type === "text", validate });
     const abort = () => {

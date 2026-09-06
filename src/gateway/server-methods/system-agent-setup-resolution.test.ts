@@ -23,7 +23,7 @@ import { wizardHandlers } from "./wizard.js";
 
 const setupInferenceMocks = vi.hoisted(() => ({ activateSetupInference: vi.fn() }));
 const providerAuthChoiceMocks = vi.hoisted(() => ({
-  applyAuthChoiceLoadedPluginProvider: vi.fn(),
+  prepareAuthChoiceLoadedPluginProvider: vi.fn(),
 }));
 const setupSharedMocks = vi.hoisted(() => ({
   readSetupConfigFileSnapshot: vi.fn(),
@@ -34,7 +34,8 @@ vi.mock("../../system-agent/setup-inference.js", () => ({
   activateSetupInference: setupInferenceMocks.activateSetupInference,
 }));
 vi.mock("../../plugins/provider-auth-choice.js", () => ({
-  applyAuthChoiceLoadedPluginProvider: providerAuthChoiceMocks.applyAuthChoiceLoadedPluginProvider,
+  prepareAuthChoiceLoadedPluginProvider:
+    providerAuthChoiceMocks.prepareAuthChoiceLoadedPluginProvider,
 }));
 vi.mock("../../wizard/setup.shared.js", () => ({
   readSetupConfigFileSnapshot: setupSharedMocks.readSetupConfigFileSnapshot,
@@ -140,7 +141,7 @@ describe("openclaw.setup provider resolution", () => {
     ]);
     expect(wizardSessions.get(params.sessionId)).toBe(retained);
     expect(setupInferenceMocks.activateSetupInference).not.toHaveBeenCalled();
-    expect(providerAuthChoiceMocks.applyAuthChoiceLoadedPluginProvider).not.toHaveBeenCalled();
+    expect(providerAuthChoiceMocks.prepareAuthChoiceLoadedPluginProvider).not.toHaveBeenCalled();
   });
 
   it.each([true, false, "true", "cancel"])(
@@ -285,10 +286,155 @@ describe("openclaw.setup provider resolution", () => {
   });
 
   it.each([
+    "cancel at credentials",
+    "expire during installation",
+    "expire at credentials",
+    "expire before provider note",
+    "expire before final commit",
+    "cancel after final commit",
+    "expire after final commit",
+  ])("retains install ownership but permits %s", async (action) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { wizardSessions, context } = makeContext();
+    const sessionId = "provider-install-then-credentials";
+    const installStarted = createDeferredCore();
+    const finishInstall = createDeferredCore();
+    const persistCredentials = vi.fn();
+    const promoteModel = vi.fn();
+    const finalCommit = action.endsWith("after final commit");
+    const expiresDuringInstall = [
+      "expire during installation",
+      "expire before provider note",
+      "expire before final commit",
+    ].includes(action);
+    let installed = false;
+    let cleaningUp = false;
+    let session: WizardSession | undefined;
+    let statusAtCheckpoint: string | undefined;
+    let abortedAtCheckpoint: boolean | undefined;
+    let offeredStepType: string | undefined;
+    let submittedBeforeCleanup = false;
+    let cancelResult: unknown;
+    setupInferenceMocks.activateSetupInference.mockImplementationOnce(
+      async (params: ActivateSetupInferenceParams) => {
+        const prompter = expectDefined(params.prompter, "provider auth prompter");
+        const accepted = await prompter.confirm({
+          message: "Install the reviewed provider?",
+          initialValue: false,
+        });
+        expect(accepted).toBe(true);
+        await params.beforePersistentEffect?.();
+        const progress = prompter.progress("Installing reviewed provider");
+        installStarted.resolve();
+        await finishInstall.promise;
+        if (cleaningUp) {
+          throw new Error("fixture cleanup");
+        }
+        params.signal?.throwIfAborted();
+        installed = true;
+        progress.stop();
+        if (action === "expire before provider note") {
+          await prompter.note("Provider installed. Continue to connect your account.");
+          if (cleaningUp) {
+            throw new Error("fixture cleanup");
+          }
+        }
+        if (action === "expire before final commit") {
+          params.onCommitStarted?.(config);
+          promoteModel();
+          return { ok: true, modelRef: "fixture/demo-model", latencyMs: 1, lines: [] };
+        }
+        if (finalCommit) {
+          params.onCommitStarted?.(config);
+        }
+        await prompter.text({ message: "Provider API key", sensitive: true });
+        params.signal?.throwIfAborted();
+        persistCredentials();
+        return { ok: true, modelRef: "fixture/demo-model", latencyMs: 1, lines: [] };
+      },
+    );
+    const cancel = async () => {
+      const { calls, respond } = makeRespond();
+      await expectDefined(
+        wizardHandlers["wizard.cancel"],
+        "wizard cancel",
+      )({
+        params: { sessionId },
+        respond,
+        context,
+      } as never);
+      return calls[0]?.payload;
+    };
+    try {
+      await systemAgentHandler("openclaw.setup.auth.start")({
+        params: { sessionId, authChoice: "fixture-provider" },
+        respond: () => undefined,
+        context,
+      } as never);
+      session = expectDefined(wizardSessions.get(sessionId), "provider auth wizard");
+      const confirmation = await callWizardNext(context, { sessionId });
+      await session.answer(expectDefined(confirmation.step, "install confirmation").id, true);
+      await installStarted.promise;
+      const progress = await callWizardNext(context, { sessionId });
+      expect(progress.step?.type).toBe("progress");
+      // A legacy client's progress acknowledgement cannot release the artifact fence.
+      await session.answer(expectDefined(progress.step, "install progress").id, undefined);
+      expect(await cancel()).toMatchObject({ status: "running" });
+      expect(session.signal.aborted).toBe(false);
+      if (expiresDuringInstall) {
+        await vi.advanceTimersByTimeAsync(25 * 60 * 1_000);
+        expect(session.getStatus()).toBe("running");
+        expect(session.signal.aborted).toBe(false);
+      }
+      const next = callWizardNext(context, { sessionId });
+      finishInstall.resolve();
+      const checkpoint = await next;
+      offeredStepType = checkpoint.step?.type;
+      if (action.startsWith("cancel")) {
+        cancelResult = await cancel();
+      } else if (!expiresDuringInstall) {
+        await vi.advanceTimersByTimeAsync(25 * 60 * 1_000);
+      }
+      statusAtCheckpoint = session.getStatus();
+      abortedAtCheckpoint = session.signal.aborted;
+      submittedBeforeCleanup = persistCredentials.mock.calls.length !== 0;
+    } finally {
+      cleaningUp = true;
+      finishInstall.resolve();
+      // The pre-fix implementation refuses cancellation even at the credential prompt.
+      // Answer it only to retire the fixture; record the tested outcome before cleanup.
+      const pending = session?.getCurrentStep();
+      if (pending?.type === "text" || pending?.type === "note") {
+        await session?.answer(pending.id, "fixture-cleanup");
+      } else {
+        session?.cancel();
+      }
+      if (session) {
+        await whenAdmittedWizardSessionSettled(session);
+      }
+      vi.useRealTimers();
+    }
+    expect(installed).toBe(true);
+    expect(submittedBeforeCleanup).toBe(false);
+    expect(setupSharedMocks.writeWizardConfigFile).not.toHaveBeenCalled();
+    expect(offeredStepType).toBe(expiresDuringInstall ? undefined : "text");
+    expect(promoteModel).not.toHaveBeenCalled();
+    expect(statusAtCheckpoint).toBe(finalCommit ? "running" : "cancelled");
+    expect(abortedAtCheckpoint).toBe(!finalCommit);
+    if (action.startsWith("cancel")) {
+      expect(cancelResult).toMatchObject({ status: finalCommit ? "running" : "cancelled" });
+    }
+    if (!finalCommit) {
+      expect(persistCredentials).not.toHaveBeenCalled();
+      expect(await session?.next()).not.toHaveProperty("modelActivation");
+    }
+  });
+
+  it.each([
     ["missing", null],
-    ["retryable", { config, retrySelection: true }],
+    ["retryable", { config, retrySelection: true, authProfiles: [], persistAuthProfiles: vi.fn() }],
   ])("returns actionable doctor guidance when provider setup is %s", async (_, result) => {
-    providerAuthChoiceMocks.applyAuthChoiceLoadedPluginProvider.mockResolvedValueOnce(result);
+    providerAuthChoiceMocks.prepareAuthChoiceLoadedPluginProvider.mockResolvedValueOnce(result);
     const { wizardSessions, context } = makeContext();
     const handler = expectDefined(
       systemAgentHandlers["openclaw.setup.prepare.start"],
@@ -613,6 +759,113 @@ describe("openclaw.setup provider resolution", () => {
       expect(wizardSessions.has(sessionId)).toBe(false);
     },
   );
+  it.each(["before credentials", "during credentials"])(
+    "keeps provider preparation consistent when expiry occurs %s",
+    async (expiryPoint) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const { wizardSessions, context } = makeContext();
+      const sessionId = "prepare-credential-commit";
+      const preparationStarted = createDeferredCore();
+      const finishPreparation = createDeferredCore();
+      const credentialWriteStarted = createDeferredCore();
+      const finishCredentialWrite = createDeferredCore();
+      const preparedConfig: OpenClawConfig = {
+        ...config,
+        auth: { profiles: { "fixture:default": { provider: "fixture", mode: "api_key" } } },
+      };
+      const beforeCredentials = expiryPoint === "before credentials";
+      let credentialsWritten = false;
+      let session: WizardSession | undefined;
+      const persistAuthProfiles = vi.fn();
+      providerAuthChoiceMocks.prepareAuthChoiceLoadedPluginProvider.mockImplementationOnce(
+        async (params) => {
+          await params.prompter.confirm({ message: "Prepare provider?", initialValue: false });
+          await params.beforePersistentEffect();
+          preparationStarted.resolve();
+          await finishPreparation.promise;
+          persistAuthProfiles.mockImplementationOnce(async () => {
+            await params.beforePersistentEffect();
+            credentialWriteStarted.resolve();
+            await finishCredentialWrite.promise;
+            credentialsWritten = true;
+          });
+          return {
+            config: preparedConfig,
+            agentModelOverride: "fixture/demo-model",
+            authProfiles: [],
+            persistAuthProfiles,
+          };
+        },
+      );
+      try {
+        await systemAgentHandler("openclaw.setup.prepare.start")({
+          params: { sessionId, authChoice: "fixture-provider" },
+          respond: () => undefined,
+          context,
+        } as never);
+        session = expectDefined(wizardSessions.get(sessionId), "provider preparation wizard");
+        const confirmation = await callWizardNext(context, { sessionId });
+        const terminal = callWizardNext(context, {
+          sessionId,
+          answer: {
+            stepId: expectDefined(confirmation.step, "prepare confirmation").id,
+            value: true,
+          },
+        });
+        await preparationStarted.promise;
+        if (beforeCredentials) {
+          await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1_000);
+          expect(session.getStatus()).toBe("running");
+          finishCredentialWrite.resolve();
+        }
+        finishPreparation.resolve();
+        if (!beforeCredentials) {
+          await credentialWriteStarted.promise;
+          await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1_000);
+          const { calls, respond } = makeRespond();
+          await expectDefined(
+            wizardHandlers["wizard.cancel"],
+            "wizard cancel",
+          )({
+            params: { sessionId },
+            respond,
+            context,
+          } as never);
+          expect(calls[0]?.payload).toMatchObject({ status: "running" });
+          expect(session.signal.aborted).toBe(false);
+          expect(setupSharedMocks.writeWizardConfigFile).not.toHaveBeenCalled();
+          finishCredentialWrite.resolve();
+        }
+        const done = await terminal;
+        expect(credentialsWritten).toBe(!beforeCredentials);
+        expect(persistAuthProfiles).toHaveBeenCalledTimes(beforeCredentials ? 0 : 1);
+        expect(done).toMatchObject({
+          done: true,
+          status: beforeCredentials ? "cancelled" : "done",
+        });
+        if (beforeCredentials) {
+          expect(setupSharedMocks.writeWizardConfigFile).not.toHaveBeenCalled();
+          expect(done).not.toHaveProperty("preparedModelRef");
+        } else {
+          expect(setupSharedMocks.writeWizardConfigFile).toHaveBeenCalledWith(
+            preparedConfig,
+            expect.objectContaining({ baseHash: "setup-resolution-config" }),
+          );
+          expect(done.preparedModelRef).toBe("fixture/demo-model");
+        }
+        expect(wizardSessions.has(sessionId)).toBe(false);
+      } finally {
+        finishPreparation.resolve();
+        finishCredentialWrite.resolve();
+        session?.cancel();
+        if (session) {
+          await whenAdmittedWizardSessionSettled(session);
+        }
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it.each([false, true])(
     "runs provider preparation with native discovery preference %s",
     async (nativeSessionCatalogsEnabled) => {
@@ -620,11 +873,17 @@ describe("openclaw.setup provider resolution", () => {
         ...config,
         models: { providers: { ollama: { baseUrl: "http://127.0.0.1:11434", models: [] } } },
       };
-      providerAuthChoiceMocks.applyAuthChoiceLoadedPluginProvider.mockImplementationOnce(
+      const persistAuthProfiles = vi.fn();
+      providerAuthChoiceMocks.prepareAuthChoiceLoadedPluginProvider.mockImplementationOnce(
         async (params) => {
           await params.prompter.note("Model ready", "Ollama");
           await params.beforePersistentEffect();
-          return { config: preparedConfig, agentModelOverride: "ollama/qwen3:0.6b" };
+          return {
+            config: preparedConfig,
+            agentModelOverride: "ollama/qwen3:0.6b",
+            authProfiles: [],
+            persistAuthProfiles,
+          };
         },
       );
       const { wizardSessions, context } = makeContext();
@@ -655,7 +914,7 @@ describe("openclaw.setup provider resolution", () => {
         done: false,
         step: { type: "note", title: "Ollama", message: "Model ready" },
       });
-      expect(providerAuthChoiceMocks.applyAuthChoiceLoadedPluginProvider).toHaveBeenCalledWith(
+      expect(providerAuthChoiceMocks.prepareAuthChoiceLoadedPluginProvider).toHaveBeenCalledWith(
         expect.objectContaining({
           authChoice: "ollama",
           agentId: "research",
@@ -676,6 +935,7 @@ describe("openclaw.setup provider resolution", () => {
         status: "done",
         preparedModelRef: "ollama/qwen3:0.6b",
       });
+      expect(persistAuthProfiles).toHaveBeenCalledOnce();
       expect(setupSharedMocks.writeWizardConfigFile).toHaveBeenCalledWith(preparedConfig, {
         allowConfigSizeDrop: false,
         baseSnapshot: expect.objectContaining({ hash: "setup-resolution-config" }),
