@@ -1,28 +1,43 @@
 import { sql } from "kysely";
-import {
-  executeSqliteQueryTakeFirstSync,
-  iterateSqliteQuerySync,
-} from "../../infra/kysely-sync.js";
+import { iterateSqliteQuerySync } from "../../infra/kysely-sync.js";
 import {
   getActiveTranscriptKysely,
   type CurrentTranscriptProjection,
 } from "./session-accessor.sqlite-projection-read.js";
-import { projectTranscriptPayloadNavigationSql } from "./session-model-context-projection.js";
+import {
+  projectDetachedAssistantModelChangeSql,
+  projectTranscriptPayloadNavigationSql,
+} from "./session-model-context-projection.js";
 import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js";
-import { transcriptEventNavigationSql } from "./transcript-payload.js";
+import {
+  transcriptEventModelNavigationSql,
+  transcriptEventNavigationSql,
+} from "./transcript-payload.js";
 
 /** State controls survive compaction independently of the summarized message prefix. */
-export function readRequiredContextControls(
+export function readRequiredContextWindow(
   projection: CurrentTranscriptProjection,
-  boundaryPosition: number,
+  boundaryPosition: number | undefined,
   keptPositions: readonly number[],
   beforeRawSeq?: number,
-): number[] {
+): {
+  sequences: number[];
+  eventCount: number;
+  sizeBytes: number;
+  assistantSequence?: number;
+  assistantSizeBytes?: number;
+} {
+  if (boundaryPosition === undefined) {
+    return { sequences: [], eventCount: 0, sizeBytes: 0 };
+  }
   const db = getActiveTranscriptKysely(projection.database);
   const navigation = transcriptEventNavigationSql("event");
   const projectedNavigation =
     /* kysely-allow-raw: imports without native metadata still return only navigation facts. */
     sql<string>`CASE WHEN event.navigation_valid = 1 THEN ${projectTranscriptPayloadNavigationSql(navigation)} ELSE ${navigation} END`;
+  const assistantModel = projectDetachedAssistantModelChangeSql(
+    transcriptEventModelNavigationSql("event"),
+  );
   const rows = iterateSqliteQuerySync(
     projection.database.db,
     db
@@ -35,6 +50,12 @@ export function readRequiredContextControls(
       .select([
         "active.event_seq",
         "active.active_position",
+        /* kysely-allow-raw: discarded assistant model state is admitted before acquisition. */
+        sql<number | null>`CASE WHEN event.navigation_valid = 1
+          AND event.navigation_last_type = 'message' AND event.message_role = 'assistant'
+          THEN octet_length(${assistantModel}) + 1 ELSE NULL END`.as("assistant_bytes"),
+        /* kysely-allow-raw: selected state uses the same byte fuse as bounded acquisition. */
+        sql<number>`${transcriptEventReadBytesSql("event")} + 1`.as("read_bytes"),
         /* kysely-allow-raw: malformed/deep legacy navigation must not hydrate an unbounded body. */
         sql<string>`CASE WHEN octet_length(${projectedNavigation}) <= 65536
           THEN ${projectedNavigation}
@@ -47,9 +68,13 @@ export function readRequiredContextControls(
       .orderBy("active.active_position", "desc"),
   );
   const selected: number[] = [];
+  let sizeBytes = 0;
+  let assistantSequence: number | undefined;
+  let assistantSizeBytes: number | undefined;
   const kept = new Set(keptPositions);
   let modelDone = false;
   for (const row of rows) {
+    // SAFETY: Only navigation tags/roles are read here; transcript readers validate payloads.
     const entry = JSON.parse(row.navigation) as {
       type?: string;
       customType?: string;
@@ -74,40 +99,52 @@ export function readRequiredContextControls(
       required = true;
     }
     if (required && row.active_position < boundaryPosition && !kept.has(row.active_position)) {
+      if (entry.type === "message" && entry.message?.role === "assistant") {
+        assistantSequence = row.event_seq;
+        assistantSizeBytes = row.assistant_bytes ?? undefined;
+      }
       selected.push(row.event_seq);
+      sizeBytes +=
+        entry.type === "message" && entry.message?.role === "assistant"
+          ? (row.assistant_bytes ?? row.read_bytes)
+          : row.read_bytes;
     }
   }
-  return selected;
+  return {
+    sequences: selected,
+    eventCount: selected.length,
+    sizeBytes,
+    assistantSequence,
+    assistantSizeBytes,
+  };
 }
 
-/** Required state uses the same raw-byte accounting as its bounded acquisition. */
-export function readRequiredContextWindow(
+/** Appends can supersede the model carrier without changing the retained boundary. */
+export function refreshRequiredContextWindow(
   projection: CurrentTranscriptProjection,
-  boundaryPosition: number | undefined,
-  keptPositions: readonly number[],
-  beforeRawSeq?: number,
-): { sequences: number[]; eventCount: number; sizeBytes: number } {
-  const sequences =
-    boundaryPosition === undefined
-      ? []
-      : readRequiredContextControls(projection, boundaryPosition, keptPositions, beforeRawSeq);
-  if (sequences.length === 0) {
-    return { sequences, eventCount: 0, sizeBytes: 0 };
+  window: ResetMessageWindow,
+): ResetMessageWindow {
+  // Appends cannot change pre-boundary controls except for the inferred assistant
+  // model carrier. Reuse static facts when there is no such carrier to supersede.
+  if (window.requiredAssistantSequence === undefined) {
+    return window;
   }
-  const db = getActiveTranscriptKysely(projection.database);
-  const facts = executeSqliteQueryTakeFirstSync(
-    projection.database.db,
-    db
-      .selectFrom("transcript_events as event")
-      .select((eb) => [
-        eb.fn.count<number>("event.seq").as("count"),
-        /* kysely-allow-raw: required state participates in the same raw-byte fuse. */
-        sql<number>`COALESCE(SUM(${transcriptEventReadBytesSql("event")} + 1), 0)`.as("bytes"),
-      ])
-      .where("event.session_id", "=", projection.resolved.sessionId)
-      .where("event.seq", "in", sequences),
+  const controls = readRequiredContextWindow(
+    projection,
+    window.boundaryActivePosition,
+    window.keptActivePositions,
   );
-  return { sequences, eventCount: facts?.count ?? 0, sizeBytes: facts?.bytes ?? 0 };
+  return {
+    ...window,
+    requiredControlSequences: controls.sequences,
+    requiredAssistantSequence: controls.assistantSequence,
+    requiredAssistantSizeBytes: controls.assistantSizeBytes,
+    requiredControlSizeBytes: controls.sizeBytes,
+    contextPrefixEventCount:
+      window.contextPrefixEventCount - window.requiredControlSequences.length + controls.eventCount,
+    contextPrefixSizeBytes:
+      window.contextPrefixSizeBytes - window.requiredControlSizeBytes + controls.sizeBytes,
+  };
 }
 
 export function selectRetainedContextRows<T extends { event: { type: string } }>(
@@ -129,6 +166,9 @@ export type ResetMessageWindow = {
   boundarySeq: number;
   keptActivePositions: number[];
   requiredControlSequences: number[];
+  requiredControlSizeBytes: number;
+  requiredAssistantSequence?: number;
+  requiredAssistantSizeBytes?: number;
   contextPrefixEventCount: number;
   keptMessagePositions: number[];
   contextPrefixSizeBytes: number;

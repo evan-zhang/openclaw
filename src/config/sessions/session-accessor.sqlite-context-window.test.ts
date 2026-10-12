@@ -12,6 +12,7 @@ import {
 import { readSessionTranscriptBoundedActiveContextCore } from "./session-accessor.sqlite-active-context.js";
 import { readActiveTranscriptStats as readSessionTranscriptActiveStats } from "./session-accessor.sqlite-history.test-support.js";
 import { seedUnindexedTranscriptForTest } from "./session-accessor.sqlite-import.test-support.js";
+import { resolveTranscriptBoundaryWindow } from "./session-accessor.sqlite-reset-window.js";
 import { waitForSessionTranscriptProjection } from "./session-transcript-reconcile.js";
 
 async function withBoundedContextScope(
@@ -390,3 +391,241 @@ it("charges the reset boundary to the same byte and event window as the reader",
     ).toBe(true);
   });
 });
+
+it.each(["assistant", "model_change"] as const)(
+  "refreshes cached required model state after a %s append",
+  async (kind) => {
+    await withBoundedContextScope(async (scope) => {
+      await appendTranscriptMessage(scope, {
+        eventId: "old-model",
+        message: { role: "assistant", content: "x".repeat(32_000), timestamp: 1 },
+      });
+      await appendTranscriptEvent(scope, {
+        type: "compaction",
+        id: "cut",
+        parentId: "old-model",
+        firstKeptEntryId: "cut",
+        summary: "Task pending",
+        tokensBefore: 100,
+      });
+      await waitForSessionTranscriptProjection(scope);
+      // Warm the context window while the old assistant is the model-state carrier.
+      expect(readSessionTranscriptActiveStats(scope).sizeBytes).toBeLessThan(4096);
+      const initial = readSessionTranscriptBoundedActiveContextCore(scope, {
+        maxBytes: 4096,
+        maxEvents: 10,
+      });
+      expect(initial.truncated).toBe(false);
+      expect(initial.events[1]).toMatchObject({ type: "model_change", id: "old-model" });
+      expect(initial.events[1]).not.toHaveProperty("provider");
+      expect(initial.events[1]).not.toHaveProperty("modelId");
+      if (kind === "assistant") {
+        await appendTranscriptMessage(scope, {
+          eventId: "new-model",
+          parentId: "cut",
+          message: { role: "assistant", content: "Continue validation.", timestamp: 2 },
+        });
+      } else {
+        await appendTranscriptEvent(scope, {
+          type: "model_change",
+          id: "new-model",
+          parentId: "cut",
+          provider: "synthetic",
+          modelId: "new-model",
+        });
+      }
+      await waitForSessionTranscriptProjection(scope);
+      const stats = readSessionTranscriptActiveStats(scope);
+      const context = readSessionTranscriptBoundedActiveContextCore(scope, {
+        maxBytes: 4096,
+        maxEvents: 10,
+        onRead: (projection) => {
+          const warm = resolveTranscriptBoundaryWindow(projection, "context");
+          // An explicit fence at the next sequence covers the identical snapshot
+          // while deliberately bypassing the reusable boundary-window cache.
+          const fresh = resolveTranscriptBoundaryWindow(
+            projection,
+            "context",
+            projection.state.indexedSeq + 1,
+          );
+          expect(warm).toEqual(fresh);
+        },
+      });
+      expect(stats.sizeBytes).toBeLessThan(4096);
+      expect(context.truncated).toBe(false);
+      expect(context.events.map((event) => (event as { id: string }).id)).toEqual([
+        scope.sessionId,
+        "cut",
+        "new-model",
+      ]);
+      expect(context.serializedBytes).toBe(
+        stats.sizeBytes + Buffer.byteLength(JSON.stringify(context.events[0])) + 1,
+      );
+    });
+  },
+);
+
+it.each(["indexed", "unindexed"] as const)(
+  "restores model metadata without acquiring a discarded %s assistant body",
+  async (indexing) => {
+    await withBoundedContextScope(async (scope) => {
+      const events = [
+        { type: "session", version: CURRENT_SESSION_VERSION, id: scope.sessionId },
+        {
+          type: "message",
+          id: "old-assistant",
+          parentId: null,
+          timestamp: "2026-10-12T00:00:00.000Z",
+          message: {
+            role: "assistant",
+            content: "discarded answer " + "x".repeat(32_000),
+            provider: "synthetic-provider",
+            model: "synthetic-model",
+          },
+        },
+        {
+          type: "message",
+          id: "kept-user",
+          parentId: "old-assistant",
+          message: { role: "user", content: "Finish validation.", timestamp: 2 },
+        },
+        {
+          type: "compaction",
+          id: "cut",
+          parentId: "kept-user",
+          firstKeptEntryId: "kept-user",
+          summary: "Validation pending",
+          timestamp: "2026-10-12T00:00:01.000Z",
+          tokensBefore: 100,
+        },
+      ];
+      if (indexing === "unindexed") {
+        await seedImportedTranscript(scope, events);
+      } else {
+        for (const event of events) {
+          if (event.type === "message") {
+            await appendTranscriptMessage(scope, {
+              eventId: event.id,
+              parentId: event.parentId,
+              now: event.timestamp ? Date.parse(event.timestamp) : undefined,
+              message: event.message!,
+            });
+          } else {
+            await appendTranscriptEvent(scope, event);
+          }
+        }
+      }
+      await waitForSessionTranscriptProjection(scope);
+      const stats = readSessionTranscriptActiveStats(scope);
+      expect(stats.sizeBytes).toBeLessThan(20_000);
+      const context = readSessionTranscriptBoundedActiveContextCore(scope, {
+        maxBytes: 20_000,
+        maxEvents: 10,
+      });
+      expect(context.truncated).toBe(false);
+      expect(context.events.map((event) => (event as { id: string }).id)).toEqual([
+        scope.sessionId,
+        "old-assistant",
+        "kept-user",
+        "cut",
+      ]);
+      expect(context.events[1]).toEqual({
+        type: "model_change",
+        id: "old-assistant",
+        parentId: null,
+        timestamp: "2026-10-12T00:00:00.000Z",
+        provider: "synthetic-provider",
+        modelId: "synthetic-model",
+      });
+      expect(context.serializedBytes).toBe(
+        stats.sizeBytes + Buffer.byteLength(JSON.stringify(context.events[0])) + 1,
+      );
+      expect(
+        SessionManager.openBounded(scope, {
+          maxBytes: 20_000,
+          maxEvents: 10,
+        }).buildSessionContext(),
+      ).toMatchObject({
+        model: { provider: "synthetic-provider", modelId: "synthetic-model" },
+        messages: [
+          { role: "compactionSummary", summary: "Validation pending" },
+          { role: "user", content: "Finish validation." },
+        ],
+      });
+      await appendTranscriptMessage(scope, {
+        eventId: "oversized-current",
+        parentId: "cut",
+        message: { role: "user", content: "current".repeat(4000), timestamp: 3 },
+      });
+      expect(
+        readSessionTranscriptBoundedActiveContextCore(scope, {
+          maxBytes: 20_000,
+          maxEvents: 10,
+        }).truncated,
+      ).toBe(true);
+    });
+  },
+);
+
+it.each(["role", "message"] as const)(
+  "retains raw admission when duplicate %s metadata disagrees with assistant navigation",
+  async (duplicate) => {
+    await withBoundedContextScope(async (scope) => {
+      const assistant = JSON.stringify({
+        role: "assistant",
+        content: "x".repeat(32_000),
+        provider: "synthetic-provider",
+        model: "synthetic-model",
+      });
+      const message =
+        duplicate === "role"
+          ? `"message":{"role":"user",${assistant.slice(1)}`
+          : `"message":{"role":"user"},"message":${assistant}`;
+      const events = [
+        JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: scope.sessionId }),
+        `{"type":"message","id":"ambiguous","parentId":null,${message}}`,
+        JSON.stringify({
+          type: "compaction",
+          id: "cut",
+          parentId: "ambiguous",
+          firstKeptEntryId: "cut",
+          summary: "Pending validation",
+          timestamp: "2026-10-12T00:00:00.000Z",
+          tokensBefore: 100,
+        }),
+      ];
+      await seedUnindexedTranscriptForTest({
+        ...scope,
+        entry: { sessionId: scope.sessionId, updatedAt: 1 },
+        events: events.map((event_json, seq) => ({
+          session_id: scope.sessionId,
+          seq,
+          created_at: seq,
+          event_json,
+        })),
+      });
+      await waitForSessionTranscriptProjection(scope);
+      const stats = readSessionTranscriptActiveStats(scope);
+      expect(stats.sizeBytes).toBeGreaterThan(32_000);
+      expect(
+        readSessionTranscriptBoundedActiveContextCore(scope, {
+          maxBytes: 20_000,
+          maxEvents: 10,
+        }).truncated,
+      ).toBe(true);
+      const wide = readSessionTranscriptBoundedActiveContextCore(scope, {
+        maxBytes: 64_000,
+        maxEvents: 10,
+      });
+      expect(wide.truncated).toBe(false);
+      expect(wide.events[1]).toMatchObject({
+        type: "message",
+        id: "ambiguous",
+        message: { role: "assistant", provider: "synthetic-provider", model: "synthetic-model" },
+      });
+      expect(wide.serializedBytes).toBe(
+        stats.sizeBytes + Buffer.byteLength(JSON.stringify(wide.events[0])) + 1,
+      );
+    });
+  },
+);

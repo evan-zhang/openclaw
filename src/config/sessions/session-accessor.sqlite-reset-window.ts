@@ -11,6 +11,7 @@ import { pruneMapToMaxSize } from "../../infra/map-size.js";
 import { hasUncommittedSqliteWrites } from "../../infra/sqlite-schema-facts.js";
 import {
   readRequiredContextWindow,
+  refreshRequiredContextWindow,
   type ResetMessageWindow,
   selectRetainedContextRows,
 } from "./session-accessor.sqlite-context-controls.js";
@@ -397,6 +398,9 @@ function findLatestResetMessageWindow(
     boundarySeq: latestBoundary.seq,
     keptActivePositions,
     requiredControlSequences: controls.sequences,
+    requiredControlSizeBytes: controls.sizeBytes,
+    requiredAssistantSequence: controls.assistantSequence,
+    requiredAssistantSizeBytes: controls.assistantSizeBytes,
     contextPrefixEventCount,
     keptMessagePositions,
     contextPrefixSizeBytes,
@@ -424,8 +428,16 @@ export function resolveTranscriptBoundaryWindow(
     if (cached.generation === generation && cached.window) {
       const latestBoundary = readLatestActiveBoundaryMetadata(projection, scope);
       if (latestBoundary?.seq === cached.window.boundarySeq) {
-        cacheResetMessageWindow(key, { ...cached, indexedSeq: projection.state.indexedSeq });
-        return cached.window;
+        const window =
+          scope === "context"
+            ? refreshRequiredContextWindow(projection, cached.window)
+            : cached.window;
+        cacheResetMessageWindow(key, {
+          ...cached,
+          indexedSeq: projection.state.indexedSeq,
+          window,
+        });
+        return window;
       }
     }
   }

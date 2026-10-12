@@ -49,132 +49,152 @@ function assertTaskAndToolPairs(manager: SessionManager) {
   }
 }
 
-it("retains task state through three SQLite compactions and bounded reopens", async () => {
-  streamMocks.streamSimple.mockImplementation((model, context) => {
-    const input = JSON.stringify(context);
-    // A split turn has its own summary request without the previous summary.
-    // Only carry markers present in this request so the provider cannot mask loss.
-    const retainedMarkers = taskState.filter((marker) => input.includes(marker));
-    return createAssistantResultStream(
-      createAssistant(model, [
-        { type: "text", text: retainedMarkers.join("\n") || "Validation prefix completed." },
-      ]),
-    );
-  });
-  await withOpenClawTestState({ label: "repeated-context-window" }, async (state) => {
-    const scope = {
-      agentId: "main",
-      sessionId: "context-window",
-      sessionKey: "agent:main:context-window",
-      storePath: path.join(state.sessionsDir("main"), "sessions.json"),
-      env: state.env,
-    };
-    await importSqliteSessionRows({
-      ...scope,
-      entry: { sessionId: scope.sessionId, updatedAt: 1 },
-      readTranscriptEvents: (append) => {
-        append({ type: "session", version: CURRENT_SESSION_VERSION, id: scope.sessionId });
-        append({
-          type: "message",
-          id: "old",
-          parentId: null,
-          message: { role: "user", content: "x".repeat(32_000), timestamp: 1 },
-        });
-        append({
-          type: "message",
-          id: "kept",
-          parentId: "old",
-          message: { role: "user", content: "Continue validation.", timestamp: 2 },
-        });
-        append({
-          type: "compaction",
-          id: "cut",
-          parentId: "kept",
-          firstKeptEntryId: "kept",
-          timestamp: "2026-01-01T00:00:00.000Z",
-          summary: taskState.join("\n"),
-          tokensBefore: 10_000,
-        });
-        append({
-          type: "message",
-          id: "tail",
-          parentId: "cut",
-          message: createAssistant(testModel, [{ type: "text", text: "Validation pending." }]),
-        });
-      },
+it.each(["user", "assistant"] as const)(
+  "retains task state through three SQLite compactions with a discarded %s prefix",
+  async (prefixRole) => {
+    streamMocks.streamSimple.mockImplementation((model, context) => {
+      const input = JSON.stringify(context);
+      // A split turn has its own summary request without the previous summary.
+      // Only carry markers present in this request so the provider cannot mask loss.
+      const retainedMarkers = taskState.filter((marker) => input.includes(marker));
+      return createAssistantResultStream(
+        createAssistant(model, [
+          { type: "text", text: retainedMarkers.join("\n") || "Validation prefix completed." },
+        ]),
+      );
     });
-    const database = openOpenClawAgentDatabase(scope);
-    const original = readTranscriptStorageRows(database, scope.sessionId);
-    const digest = (rows: typeof original) =>
-      createHash("sha256").update(JSON.stringify(rows)).digest("hex");
-    const originalDigest = digest(original);
-    const limits = { maxBytes: 20_000, maxEvents: 40 };
-    for (let cycle = 0; cycle < 3; cycle++) {
-      const manager = await SessionManager.openBoundedAsync(scope, {
-        ...limits,
-        onTruncated: () => {
-          throw new Error("A compacted ancestor consumed the context budget");
+    await withOpenClawTestState({ label: "repeated-context-window" }, async (state) => {
+      const scope = {
+        agentId: "main",
+        sessionId: "context-window",
+        sessionKey: "agent:main:context-window",
+        storePath: path.join(state.sessionsDir("main"), "sessions.json"),
+        env: state.env,
+      };
+      await importSqliteSessionRows({
+        ...scope,
+        entry: { sessionId: scope.sessionId, updatedAt: 1 },
+        readTranscriptEvents: (append) => {
+          append({ type: "session", version: CURRENT_SESSION_VERSION, id: scope.sessionId });
+          append({
+            type: "message",
+            id: "old",
+            parentId: null,
+            message:
+              prefixRole === "assistant"
+                ? createAssistant(testModel, [{ type: "text", text: "x".repeat(32_000) }])
+                : { role: "user", content: "x".repeat(32_000), timestamp: 1 },
+          });
+          append({
+            type: "message",
+            id: "kept",
+            parentId: "old",
+            message: { role: "user", content: "Continue validation.", timestamp: 2 },
+          });
+          append({
+            type: "compaction",
+            id: "cut",
+            parentId: "kept",
+            firstKeptEntryId: "kept",
+            timestamp: "2026-01-01T00:00:00.000Z",
+            summary: taskState.join("\n"),
+            tokensBefore: 10_000,
+          });
+          append({
+            type: "message",
+            id: "tail",
+            parentId: "cut",
+            message:
+              prefixRole === "assistant"
+                ? { role: "user", content: "Continue validation.", timestamp: 3 }
+                : createAssistant(testModel, [{ type: "text", text: "Validation pending." }]),
+          });
         },
       });
-      assertTaskAndToolPairs(manager);
-      // Keep enough completed history to exercise the configured retained tail,
-      // rather than manual compaction's fallback to a minimal tail for small sessions.
-      await manager.appendMessageAsync(
-        createAssistant(testModel, [{ type: "text", text: "completed history ".repeat(500) }]),
-      );
-      await manager.appendMessageAsync({
-        role: "user",
-        content: "Continue without restating the task.",
-        timestamp: cycle + 3,
-      });
-      const toolCallId = `validation-${cycle}`;
-      await manager.appendMessageAsync(
-        createAssistant(testModel, [
-          { type: "toolCall", id: toolCallId, name: "read", arguments: {} },
-        ]),
-      );
-      await manager.appendMessageAsync({
-        role: "toolResult",
-        toolCallId,
-        toolName: "read",
-        isError: false,
-        content: [{ type: "text", text: "completed ".repeat(80) }],
-        timestamp: cycle + 4,
-      });
-      await manager.appendMessageAsync(
-        createAssistant(testModel, [
-          { type: "text", text: "Validation recorded; approval pending." },
-        ]),
-      );
-      assertTaskAndToolPairs(manager);
-      const { session } = await createTestSession({
-        sessionManager: manager,
-        settingsManager: SettingsManager.inMemory({
-          compaction: { enabled: false, reserveTokens: 1024, keepRecentTokens: 1536 },
-          retry: { enabled: false },
-        }),
-      });
-      try {
-        const callsBefore = streamMocks.streamSimple.mock.calls.length;
-        await session.compact("Preserve pending tasks, approvals, and identifiers.");
-        expect(streamMocks.streamSimple.mock.calls.length).toBeGreaterThan(callsBefore);
-      } finally {
-        session.dispose();
+      const database = openOpenClawAgentDatabase(scope);
+      const original = readTranscriptStorageRows(database, scope.sessionId);
+      const digest = (rows: typeof original) =>
+        createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+      const originalDigest = digest(original);
+      const limits = { maxBytes: 20_000, maxEvents: 40 };
+      for (let cycle = 0; cycle < 3; cycle++) {
+        const manager = await SessionManager.openBoundedAsync(scope, {
+          ...limits,
+          onTruncated: () => {
+            throw new Error("A compacted ancestor consumed the context budget");
+          },
+        });
+        assertTaskAndToolPairs(manager);
+        if (cycle === 0 && prefixRole === "assistant") {
+          expect(manager.getEntry("old")).toMatchObject({
+            type: "model_change",
+            provider: testModel.provider,
+            modelId: testModel.id,
+          });
+          expect(manager.buildSessionContext().model).toEqual({
+            provider: testModel.provider,
+            modelId: testModel.id,
+          });
+        }
+        // Keep enough completed history to exercise the configured retained tail,
+        // rather than manual compaction's fallback to a minimal tail for small sessions.
+        await manager.appendMessageAsync(
+          createAssistant(testModel, [{ type: "text", text: "completed history ".repeat(500) }]),
+        );
+        await manager.appendMessageAsync({
+          role: "user",
+          content: "Continue without restating the task.",
+          timestamp: cycle + 3,
+        });
+        const toolCallId = `validation-${cycle}`;
+        await manager.appendMessageAsync(
+          createAssistant(testModel, [
+            { type: "toolCall", id: toolCallId, name: "read", arguments: {} },
+          ]),
+        );
+        await manager.appendMessageAsync({
+          role: "toolResult",
+          toolCallId,
+          toolName: "read",
+          isError: false,
+          content: [{ type: "text", text: "completed ".repeat(80) }],
+          timestamp: cycle + 4,
+        });
+        await manager.appendMessageAsync(
+          createAssistant(testModel, [
+            { type: "text", text: "Validation recorded; approval pending." },
+          ]),
+        );
+        assertTaskAndToolPairs(manager);
+        const { session } = await createTestSession({
+          sessionManager: manager,
+          settingsManager: SettingsManager.inMemory({
+            compaction: { enabled: false, reserveTokens: 1024, keepRecentTokens: 1536 },
+            retry: { enabled: false },
+          }),
+        });
+        try {
+          const callsBefore = streamMocks.streamSimple.mock.calls.length;
+          await session.compact("Preserve pending tasks, approvals, and identifiers.");
+          expect(streamMocks.streamSimple.mock.calls.length).toBeGreaterThan(callsBefore);
+        } finally {
+          session.dispose();
+        }
+        const reopened = await SessionManager.openBoundedAsync(scope, {
+          ...limits,
+          onTruncated: () => {
+            throw new Error("Compaction did not release its read budget");
+          },
+        });
+        assertTaskAndToolPairs(reopened);
+        expect(reopened.buildSessionContext().messages).toEqual(
+          expect.arrayContaining([expect.objectContaining({ role: "toolResult", toolCallId })]),
+        );
+        expect(readActiveTranscriptStats(scope).sizeBytes).toBeLessThan(limits.maxBytes);
+        expect(
+          digest(readTranscriptStorageRows(database, scope.sessionId).slice(0, original.length)),
+        ).toBe(originalDigest);
       }
-      const reopened = await SessionManager.openBoundedAsync(scope, {
-        ...limits,
-        onTruncated: () => {
-          throw new Error("Compaction did not release its read budget");
-        },
-      });
-      assertTaskAndToolPairs(reopened);
-      expect(reopened.buildSessionContext().messages).toEqual(
-        expect.arrayContaining([expect.objectContaining({ role: "toolResult", toolCallId })]),
-      );
-      expect(readActiveTranscriptStats(scope).sizeBytes).toBeLessThan(limits.maxBytes);
-      expect(
-        digest(readTranscriptStorageRows(database, scope.sessionId).slice(0, original.length)),
-      ).toBe(originalDigest);
-    }
-  });
-});
+    });
+  },
+);

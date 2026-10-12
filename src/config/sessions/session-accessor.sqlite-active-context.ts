@@ -33,9 +33,14 @@ import { readSessionActorTransactionState } from "./session-actor-transaction.js
 import { selectBoundedContextRows } from "./session-bounded-context-selection.js";
 import { readCacheTtlProjectionPrefix } from "./session-cache-ttl-prefix.js";
 import { isIndexedSessionEntry } from "./session-entry-codec.js";
+import { projectDetachedAssistantModelChangeSql } from "./session-model-context-projection.js";
 import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js";
 import { resolveSqliteSessionTranscriptReadFence } from "./session-transcript-read-fence.js";
-import { transcriptEventJsonSql, transcriptEventResetNavigationSql } from "./transcript-payload.js";
+import {
+  transcriptEventJsonSql,
+  transcriptEventModelNavigationSql,
+  transcriptEventResetNavigationSql,
+} from "./transcript-payload.js";
 import { assertTranscriptNavigationValid } from "./transcript-predicate-fields.js";
 
 function readBoundedRetentionRanges(
@@ -290,6 +295,11 @@ export function readSessionTranscriptBoundedActiveContextCore(
     const window = resolveTranscriptBoundaryWindow(projection, "context", fence?.beforeRawSeq);
     const retained = window?.keptActivePositions.slice(-(maxEvents + 1)) ?? [];
     const controls = window?.requiredControlSequences ?? [];
+    // Ambiguous legacy role predicates retain raw acquisition and accounting together.
+    const assistantSequence =
+      window?.requiredAssistantSizeBytes === undefined
+        ? undefined
+        : window.requiredAssistantSequence;
     const metadata = iterateSqliteQuerySync(
       projection.database.db,
       db
@@ -303,7 +313,9 @@ export function readSessionTranscriptBoundedActiveContextCore(
           "active.event_seq",
           "active.active_position",
           /* kysely-allow-raw: active-context byte caps exclude rows before fetching or parsing. */
-          sql<number>`${transcriptEventReadBytesSql("event")} + 1`.as("serialized_bytes"),
+          sql<number>`CASE WHEN active.event_seq = ${assistantSequence ?? -1}
+            THEN ${window?.requiredAssistantSizeBytes ?? 0}
+            ELSE ${transcriptEventReadBytesSql("event")} + 1 END`.as("serialized_bytes"),
         ])
         .where("active.session_id", "=", projection.resolved.sessionId)
         .$if(fence !== undefined, (query) =>
@@ -406,7 +418,13 @@ export function readSessionTranscriptBoundedActiveContextCore(
         : executeSqliteQuerySync(
             projection.database.db,
             transcript
-              .select(["seq", transcriptEventJsonSql(projection.database.db).as("event_json")])
+              .select([
+                "seq",
+                /* kysely-allow-raw: only admitted detached model metadata replaces an omitted body. */
+                sql<string>`CASE WHEN seq = ${assistantSequence ?? -1}
+                  THEN ${projectDetachedAssistantModelChangeSql(transcriptEventModelNavigationSql())}
+                  ELSE ${transcriptEventJsonSql(projection.database.db)} END`.as("event_json"),
+              ])
               .where("seq", "in", payloadSequences),
           ).rows
       ).map((row) => [row.seq, JSON.parse(row.event_json)]),
