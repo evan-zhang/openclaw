@@ -10,6 +10,11 @@ import {
 import { pruneMapToMaxSize } from "../../infra/map-size.js";
 import { hasUncommittedSqliteWrites } from "../../infra/sqlite-schema-facts.js";
 import {
+  readRequiredContextWindow,
+  type ResetMessageWindow,
+  selectRetainedContextRows,
+} from "./session-accessor.sqlite-context-controls.js";
+import {
   iterateUnindexedActiveTranscriptNavigation,
   iterateUnindexedTranscriptNavigation,
 } from "./session-accessor.sqlite-history-navigation.js";
@@ -42,15 +47,6 @@ type VisibleMessagePositions = {
   kept: number[];
   postStart: number;
   total: number;
-};
-
-type ResetMessageWindow = {
-  boundarySeq: number;
-  contextPrefixEventCount: number;
-  keptMessagePositions: number[];
-  contextPrefixSizeBytes: number;
-  postBoundaryMessagePosition: number;
-  boundaryActivePosition: number;
 };
 
 type ResetMessageWindowCacheEntry = {
@@ -292,7 +288,8 @@ function findLatestResetMessageWindow(
         .limit(1),
     )?.message_position ?? projection.state.activeMessageCount;
   const keptMessagePositions: number[] = [];
-  const includesBoundary = latestBoundary.event_type === "compaction";
+  const keptActivePositions: number[] = [];
+  const includesBoundary = scope === "context" || latestBoundary.event_type === "compaction";
   let contextPrefixEventCount = includesBoundary ? 1 : 0;
   let contextPrefixSizeBytes = includesBoundary ? boundary.sizeBytes : 0;
   if (typeof boundary.firstKeptEntryId === "string") {
@@ -334,6 +331,7 @@ function findLatestResetMessageWindow(
           )
           .select([
             "active.message_position",
+            "active.active_position",
             /* kysely-allow-raw: preserve JS-readable overdepth rows for existing tool-pairing validation. */
             sql<string>`CASE WHEN json_valid(${transcriptEventNavigationSql("event")})
               THEN ${transcriptEventModelNavigationSql("event")}
@@ -344,7 +342,9 @@ function findLatestResetMessageWindow(
           .where("active.session_id", "=", projection.resolved.sessionId)
           .where("active.active_position", ">=", firstKept.active_position)
           .where("active.active_position", "<", latestBoundary.active_position)
-          .where("active.message_position", "is not", null)
+          .$if(scope !== "context" || latestBoundary.event_type === "reset", (query) =>
+            query.where("active.message_position", "is not", null),
+          )
           .$if(scope === "context" && latestBoundary.event_type !== "reset", (query) =>
             query.where("active.context_eligible", "=", 1),
           )
@@ -355,6 +355,7 @@ function findLatestResetMessageWindow(
         try {
           candidates.push({
             message_position: row.message_position,
+            active_position: row.active_position,
             serialized_bytes: row.serialized_bytes,
             event: JSON.parse(row.event_json) as SessionTreeEntry,
           });
@@ -362,8 +363,8 @@ function findLatestResetMessageWindow(
           continue;
         }
       }
-      // A compaction keeps its whole tail; a reset replays only the paired subset.
-      let keptRows = candidates;
+      // A compaction keeps its semantic tail; a reset replays only the paired subset.
+      let keptRows = selectRetainedContextRows(candidates, scope, latestBoundary.event_type);
       if (latestBoundary.event_type === "reset") {
         const keptEntries = new Set(selectResetKeptEntries(candidates.map((row) => row.event)));
         keptRows = candidates.filter((row) => keptEntries.has(row.event));
@@ -373,6 +374,7 @@ function findLatestResetMessageWindow(
       // History presentation exposes user/assistant rows, while fresh-thread context
       // also retains paired tool results. The fuse stats above must cover that context.
       for (const row of keptRows) {
+        keptActivePositions.push(row.active_position);
         if (row.message_position === null || row.event.type !== "message") {
           continue;
         }
@@ -383,8 +385,18 @@ function findLatestResetMessageWindow(
       }
     }
   }
+  const controls = readRequiredContextWindow(
+    projection,
+    scope === "context" ? latestBoundary.active_position : undefined,
+    keptActivePositions,
+    beforeRawSeq,
+  );
+  contextPrefixEventCount += controls.eventCount;
+  contextPrefixSizeBytes += controls.sizeBytes;
   return {
     boundarySeq: latestBoundary.seq,
+    keptActivePositions,
+    requiredControlSequences: controls.sequences,
     contextPrefixEventCount,
     keptMessagePositions,
     contextPrefixSizeBytes,

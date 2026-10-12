@@ -287,12 +287,9 @@ export function readSessionTranscriptBoundedActiveContextCore(
     const headerBytes = header?.serialized_bytes ?? 0;
     // Explicit reset retention wins over ordinary exclusion. The window owner
     // selects paired entries; only its newest candidates can fit this bounded read.
-    const retained =
-      resolveTranscriptBoundaryWindow(
-        projection,
-        "context",
-        fence?.beforeRawSeq,
-      )?.keptMessagePositions.slice(-(maxEvents + 1)) ?? [];
+    const window = resolveTranscriptBoundaryWindow(projection, "context", fence?.beforeRawSeq);
+    const retained = window?.keptActivePositions.slice(-(maxEvents + 1)) ?? [];
+    const controls = window?.requiredControlSequences ?? [];
     const metadata = iterateSqliteQuerySync(
       projection.database.db,
       db
@@ -312,14 +309,19 @@ export function readSessionTranscriptBoundedActiveContextCore(
         .$if(fence !== undefined, (query) =>
           query.where("active.event_seq", "<", fence!.beforeRawSeq),
         )
-        .where((eb) =>
-          retained.length > 0
-            ? eb.or([
+        .where((eb) => {
+          const current = window
+            ? eb.and([
                 eb("active.context_eligible", "=", 1),
-                eb("active.message_position", "in", retained),
+                eb("active.active_position", ">=", window.boundaryActivePosition),
               ])
-            : eb("active.context_eligible", "=", 1),
-        )
+            : eb("active.context_eligible", "=", 1);
+          return eb.or([
+            current,
+            ...(retained.length > 0 ? [eb("active.active_position", "in", retained)] : []),
+            ...(controls.length > 0 ? [eb("active.event_seq", "in", controls)] : []),
+          ]);
+        })
         .orderBy("active.active_position", "desc")
         .limit(maxEvents + 1),
     );
@@ -436,18 +438,19 @@ export function readSessionTranscriptBoundedActiveContextCore(
       events.push(event);
     }
     const firstSelected = selectedRows.findLast(
-      (row) => typeof asOptionalRecord(payloads.get(row.event_seq))?.id === "string",
+      (row) =>
+        (!window ||
+          row.active_position >= window.boundaryActivePosition ||
+          retained.includes(row.active_position)) &&
+        typeof asOptionalRecord(payloads.get(row.event_seq))?.id === "string",
     );
     const anchorEntry = firstSelected
       ? asOptionalRecord(payloads.get(firstSelected.event_seq))
       : undefined;
-    const injectedEntry =
-      injectedBoundarySeq === undefined
-        ? undefined
-        : asOptionalRecord(payloads.get(injectedBoundarySeq));
+    const boundaryEntry = boundary ? asOptionalRecord(payloads.get(boundary.seq)) : undefined;
     const anchors = [
-      ...(boundary && isIndexedSessionEntry(injectedEntry) && injectedEntry.type === "compaction"
-        ? [{ activePosition: boundary.active_position, id: injectedEntry.id, entry: injectedEntry }]
+      ...(boundary && isIndexedSessionEntry(boundaryEntry) && boundaryEntry.type === "compaction"
+        ? [{ activePosition: boundary.active_position, id: boundaryEntry.id, entry: boundaryEntry }]
         : []),
       ...(firstSelected && typeof anchorEntry?.id === "string"
         ? [
